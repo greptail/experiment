@@ -1,0 +1,67 @@
+public BrokerClient(String brokerUrl, String prefix) {
+    this.brokerUrl = brokerUrl;
+
+    ConnectionProvider provider =
+        ConnectionProvider.builder("producer")
+            .maxConnections(2000) // VERY HIGH concurrency
+            .pendingAcquireMaxCount(-1) // unlimited queue (NO rejection)
+            .pendingAcquireTimeout(Duration.ZERO) // NO PendingAcquireTimeoutException
+            .build();
+    HttpClient httpClient =
+        HttpClient.create(provider)
+            .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 5000) // 5s connect timeout
+            .responseTimeout(Duration.ofSeconds(5)) // 5s read/response timeout
+            .doOnConnected(
+                conn ->
+                    conn.addHandlerLast(new ReadTimeoutHandler(5, TimeUnit.SECONDS))
+                        .addHandlerLast(new WriteTimeoutHandler(5, TimeUnit.SECONDS)));
+    this.webClient =
+        WebClient.builder().clientConnector(new ReactorClientHttpConnector(httpClient)).build();
+    this.vertx = Vertx.vertx(); // Create Vert.x instance
+    this.prefix = prefix;
+    queueClient =
+        new QueueClient(brokerUrl, ClientFactory.createClient(connectTimeout, readTimeout));
+    setUpSchedule();
+  }
+
+  public void delete(String sourceQueue) {
+    queueClient.delete(sourceQueue).block();
+  }
+
+  /**
+   * Publishes a message to the specified queue.
+   *
+   * @param queue the name of the queue to publish the message to
+   * @param message the message to be published
+   * @return a Mono emitting the response from the broker as a String
+   */
+  public Mono<String> publish(String queue, Message message) {
+    String url = brokerUrl + "/api/queue/publish/" + queue;
+    byte[] body =
+        BrokerMessage.toBigQueueTextMessage(BrokerMessage.fromMessage(message)).toByteArray();
+
+    return Mono.defer(
+        () -> {
+          try {
+            semaphore.acquire();
+          } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return Mono.error(e);
+          }
+
+          return webClient
+              .post()
+              .uri(url)
+              .contentType(MediaType.parseMediaType("application/x-protobuf"))
+              .bodyValue(body)
+              .retrieve()
+              .onStatus(this::isRetryableStatus, this::mapRetryableStatusError)
+              .onStatus(HttpStatusCode::is5xxServerError, this::mapNonRetryableStatusError)
+              .bodyToMono(String.class)
+              .doOnError(this::logBeforeMapping)
+              .onErrorMap(this::mapTransportError)
+              .retryWhen(buildRetrySpec())
+              .doOnError(this::logRetryState)
+              .doFinally(signal -> semaphore.release());
+        });
+  }
