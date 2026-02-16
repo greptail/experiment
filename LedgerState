@@ -1,0 +1,79 @@
+package com.open.messaging.bigbro.broker.keeper.ledger;
+
+/**
+ * Represents the lifecycle states of a managed ledger. Follows a state machine pattern for
+ * thread-safe state transitions.
+ */
+public enum LedgerState {
+
+  /** Initial state - ledger not yet initialized. */
+  NONE,
+
+  /** A ledger is open and ready to accept writes. */
+  LEDGER_OPENED,
+
+  /** Current ledger is being closed (pending entries being flushed). */
+  CLOSING_LEDGER,
+
+  /** Current ledger has been closed successfully. */
+  CLOSED_LEDGER,
+
+  /** A new ledger is being created asynchronously. */
+  CREATING_LEDGER,
+
+  /** Managed ledger has been closed permanently. */
+  CLOSED,
+
+  /**
+   * Ledger is fenced due to concurrent access from another session. All operations will fail in
+   * this state.
+   */
+  FENCED {
+    @Override
+    public boolean isFenced() {
+      return true;
+    }
+  },
+
+  /** Ledger was terminated - no more entries allowed. Reads are still permitted. */
+  TERMINATED,
+
+  /** A write failure occurred, waiting for recovery. */
+  WRITE_FAILED;
+
+  /**
+   * Checks if this state represents a fenced condition.
+   *
+   * @return true if fenced, false otherwise
+   */
+  public boolean isFenced() {
+    return false;
+  }
+
+  /**
+   * Checks if this state allows write operations.
+   *
+   * @return true if writes are allowed
+   */
+  public boolean isWritable() {
+    return this == LEDGER_OPENED;
+  }
+
+  /**
+   * Checks if this state indicates the ledger is closed or closing.
+   *
+   * @return true if closed or closing
+   */
+  public boolean isClosedOrClosing() {
+    return this == CLOSED || this == CLOSING_LEDGER || this == CLOSED_LEDGER;
+  }
+
+  /**
+   * Checks if this state allows new ledger creation.
+   *
+   * @return true if new ledger can be created
+   */
+  public boolean canCreateNewLedger() {
+    return this == CLOSED_LEDGER || this == WRITE_FAILED;
+  }
+}
