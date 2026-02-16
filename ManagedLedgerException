@@ -1,0 +1,130 @@
+package com.open.messaging.bigbro.broker.keeper.ledger;
+
+/** Base exception class for all managed ledger related errors. */
+public class ManagedLedgerException extends Exception {
+
+  private static final long serialVersionUID = 1L;
+
+  public ManagedLedgerException(String message) {
+    super(message);
+  }
+
+  public ManagedLedgerException(String message, Throwable cause) {
+    super(message, cause);
+  }
+
+  public ManagedLedgerException(Throwable cause) {
+    super(cause);
+  }
+
+  /** Exception thrown when the managed ledger is fenced. */
+  public static class ManagedLedgerFencedException extends ManagedLedgerException {
+    private static final long serialVersionUID = 1L;
+
+    public ManagedLedgerFencedException() {
+      super("Managed ledger is fenced");
+    }
+
+    public ManagedLedgerFencedException(String message) {
+      super(message);
+    }
+  }
+
+  /** Exception thrown when the managed ledger is terminated. */
+  public static class ManagedLedgerTerminatedException extends ManagedLedgerException {
+    private static final long serialVersionUID = 1L;
+
+    public ManagedLedgerTerminatedException() {
+      super("Managed ledger is terminated");
+    }
+
+    public ManagedLedgerTerminatedException(String message) {
+      super(message);
+    }
+  }
+
+  /** Exception thrown when the managed ledger is already closed. */
+  public static class ManagedLedgerClosedException extends ManagedLedgerException {
+    private static final long serialVersionUID = 1L;
+
+    public ManagedLedgerClosedException() {
+      super("Managed ledger is already closed");
+    }
+
+    public ManagedLedgerClosedException(String message) {
+      super(message);
+    }
+  }
+
+  /** Exception thrown when too many pending add operations. */
+  public static class TooManyPendingAddEntriesException extends ManagedLedgerException {
+    private static final long serialVersionUID = 1L;
+
+    public TooManyPendingAddEntriesException(String message) {
+      super(message);
+    }
+  }
+
+  /** Exception thrown when a ledger creation fails. */
+  public static class LedgerCreationException extends ManagedLedgerException {
+    private static final long serialVersionUID = 1L;
+    private final int bookKeeperErrorCode;
+
+    public LedgerCreationException(int bkErrorCode, String message) {
+      super(message);
+      this.bookKeeperErrorCode = bkErrorCode;
+    }
+
+    public int getBookKeeperErrorCode() {
+      return bookKeeperErrorCode;
+    }
+  }
+
+  /** Exception thrown when a write operation fails. */
+  public static class WriteFailedException extends ManagedLedgerException {
+    private static final long serialVersionUID = 1L;
+    private final int bookKeeperErrorCode;
+
+    public WriteFailedException(int bkErrorCode, String message) {
+      super(message);
+      this.bookKeeperErrorCode = bkErrorCode;
+    }
+
+    public WriteFailedException(String message, Throwable cause) {
+      super(message, cause);
+      this.bookKeeperErrorCode = -1;
+    }
+
+    public int getBookKeeperErrorCode() {
+      return bookKeeperErrorCode;
+    }
+  }
+
+  /** Exception thrown when an operation times out. */
+  public static class OperationTimeoutException extends ManagedLedgerException {
+    private static final long serialVersionUID = 1L;
+
+    public OperationTimeoutException(String message) {
+      super(message);
+    }
+  }
+
+  /**
+   * Creates an appropriate exception from a BookKeeper error code.
+   *
+   * @param bkErrorCode the BookKeeper error code
+   * @return the corresponding ManagedLedgerException
+   */
+  public static ManagedLedgerException fromBookKeeperException(int bkErrorCode) {
+    String message = "BookKeeper error: " + bkErrorCode;
+
+    switch (bkErrorCode) {
+      case org.apache.bookkeeper.client.api.BKException.Code.LedgerFencedException:
+        return new ManagedLedgerFencedException("Ledger was fenced: " + bkErrorCode);
+      case org.apache.bookkeeper.client.api.BKException.Code.LedgerClosedException:
+        return new ManagedLedgerClosedException("Ledger was closed: " + bkErrorCode);
+      default:
+        return new WriteFailedException(bkErrorCode, message);
+    }
+  }
+}
