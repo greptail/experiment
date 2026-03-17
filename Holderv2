@@ -1,0 +1,560 @@
+package com.open.messaging.bigbro.broker.manager;
+
+import com.google.common.util.concurrent.RateLimiter;
+import com.leansoft.bigqueue.BigQueueImpl;
+import com.open.messaging.bigbro.broker.BigQueueTextMessage;
+import com.open.messaging.bigbro.broker.dto.QueueMeta;
+import io.github.bucket4j.Bandwidth;
+import io.github.bucket4j.Bucket;
+import io.github.bucket4j.BucketConfiguration;
+import io.github.bucket4j.distributed.ExpirationAfterWriteStrategy;
+import io.github.bucket4j.distributed.proxy.ProxyManager;
+import io.github.bucket4j.distributed.serialization.Mapper;
+import io.github.bucket4j.redis.jedis.cas.JedisBasedProxyManager;
+import io.micrometer.core.instrument.MeterRegistry;
+import java.time.Duration;
+import java.util.Date;
+import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+@Slf4j
+@Data
+public class QueueHolder {
+  private final AtomicInteger inFlight = new AtomicInteger(0);
+  private BigQueueImpl queue;
+  private Date createAt = new Date();
+  private Long lastMessagedPushedAt = System.currentTimeMillis();
+  private QueueMeta metaData;
+  private Optional<ScheduledFuture<?>> future = Optional.empty();
+  private final ScheduledExecutorService scheduler;
+  private final AtomicInteger currentTps = new AtomicInteger(0);
+  private AtomicBoolean isEmitting = new AtomicBoolean(true);
+  private QueueManager manager;
+  private final RateLimiter limiter;
+  private final MeterRegistry meterRegistry;
+  private static final double TPS_FACTOR = 1;
+  private int effectiveTps;
+
+  private static final String RATE_LIMITER_KEY_PREFIX = "rate-limiter:";
+  private final ProxyManager<String> recoveryProxyManager;
+  private volatile Bucket recoveryBucket;
+
+  public QueueHolder(
+      BigQueueImpl queue, Date createAt, QueueMeta metaData, BigQueueManager manager) {
+    super();
+    this.queue = queue;
+    this.metaData = metaData;
+    currentTps.set(metaData.getTps());
+    limiter = RateLimiter.create(metaData.getTps() * TPS_FACTOR);
+    this.createAt = createAt;
+    this.manager = manager;
+    this.meterRegistry = manager.getMeterRegistry();
+    this.recoveryProxyManager =
+        JedisBasedProxyManager.builderFor(manager.getJedisCluster())
+            .withKeyMapper(Mapper.STRING)
+            .withExpirationStrategy(
+                ExpirationAfterWriteStrategy.basedOnTimeForRefillingBucketUpToMax(
+                    Duration.ofSeconds(10)))
+            .build();
+    this.recoveryBucket = buildRecoveryBucket(metaData.getTps());
+    this.scheduler =
+        Executors.newScheduledThreadPool(
+            5,
+            new ThreadFactory() {
+              private final ThreadFactory defaultFactory = Executors.defaultThreadFactory();
+              private final AtomicInteger count = new AtomicInteger(1);
+
+              @Override
+              public Thread newThread(Runnable r) {
+                Thread t = defaultFactory.newThread(r);
+                t.setName("sched-" + metaData.getName() + "-" + count.getAndIncrement());
+                return t;
+              }
+            });
+  }
+
+  public int getPendingAcks() {
+    return inFlight.get();
+  }
+
+  public void shutdown() {
+    this.future.ifPresent(f -> f.cancel(true));
+    this.scheduler.shutdown();
+  }
+
+  public void createScheduleIfnotExist() {
+
+    int rate = currentTps.get();
+    // Calculate batch size and scheduling interval
+    int batchSize = rate < 1000 ? 1 : rate / 1000; // Process at least one message per millisecond
+    long interval = rate < 1000 ? 1000L / rate : 1L; // Milliseconds between batches
+    int maxInflight = Math.min(100, rate / 2);
+
+    if (this.future.isEmpty()) {
+      synchronized (metaData) {
+        if (this.future.isEmpty() || this.future.get().isCancelled()) {
+          log.info(
+              "The scheduler will send batch of [{}] message(s) at every [{}] ms from queue [{}] have configured TPS of [{}]",
+              batchSize,
+              interval,
+              metaData.getName(),
+              rate);
+          this.future =
+              Optional.of(
+                  scheduler.scheduleAtFixedRate(
+                      () -> {
+                        if (this.future.isEmpty() || this.future.get().isCancelled()) return;
+
+                        if (inFlight.get() >= maxInflight) {
+                          if (log.isDebugEnabled()) {
+                            log.debug(
+                                "Skipping batch - backlog detected [{} >= {}]",
+                                inFlight.get(),
+                                maxInflight);
+                          }
+                          return;
+                        }
+                        log.debug(
+                            "Send {} batch of message from queue {}",
+                            batchSize,
+                            metaData.getName());
+                        Flux<Integer> stream = Flux.range(0, batchSize);
+
+                        stream
+                            .flatMap(
+                                messageNumber ->
+                                    Mono.fromFuture(() -> dipatchAsync(messageNumber))
+                                        .doOnSubscribe(
+                                            sub -> {
+                                              int count = inFlight.incrementAndGet();
+                                              if (count >= maxInflight) {
+                                                isEmitting.set(false);
+                                              }
+                                            })
+                                        .doFinally(
+                                            signal -> {
+                                              int remaining = inFlight.decrementAndGet();
+                                              if (remaining < maxInflight) {
+                                                isEmitting.set(true);
+                                              }
+                                            }),
+                                batchSize)
+                            .doOnComplete(
+                                () -> {
+                                  if (log.isDebugEnabled()) {
+                                    log.debug("✅ Batch of {} messages processed", batchSize);
+                                  }
+                                })
+                            .onErrorContinue(
+                                (ex, obj) ->
+                                    log.warn(
+                                        "Error during batch processing from queue {}: {}",
+                                        metaData.getName(),
+                                        ex.toString()))
+                            .subscribe();
+                      },
+                      0,
+                      interval,
+                      TimeUnit.MILLISECONDS));
+        }
+      }
+    }
+  }
+
+  private Bucket buildRecoveryBucket(int totalTps) {
+    BucketConfiguration config =
+        BucketConfiguration.builder()
+            .addLimit(
+                Bandwidth.builder()
+                    .capacity(totalTps)
+                    .refillGreedy(totalTps, Duration.ofSeconds(1))
+                    .build())
+            .build();
+    return recoveryProxyManager
+        .builder()
+        .build(RATE_LIMITER_KEY_PREFIX + metaData.getName(), () -> config);
+  }
+
+  private byte[] dequeue() {
+    try {
+      byte[] messageBytes = queue.dequeue();
+      return messageBytes;
+    } catch (Exception e) {
+      throw new RuntimeException();
+    }
+  }
+
+  private boolean hasListeners() {
+    ListenerHolder holder = manager.getListener(metaData.getName());
+    return holder != null && holder.size() > 0;
+  }
+
+  public void pipe(BigQueueTextMessage message, String action) {
+
+    int maxInflight = Math.min(100, currentTps.get() / 2);
+
+    // Check before scheduling work
+    boolean emitting = isEmitting.get();
+    boolean acquiredPermit;
+    if ("recover".equals(action)) {
+      boolean consumed = false;
+      try {
+        consumed = recoveryBucket.tryConsume(1);
+        meterRegistry
+            .counter(
+                "queue.recovery.tps",
+                "queue",
+                metaData.getName(),
+                "result",
+                consumed ? "permitted" : "denied")
+            .increment();
+      } catch (Exception e) {
+        log.warn(
+            "Redis global rate limiter unavailable for queue [{}], failing open: {}",
+            metaData.getName(),
+            e.getMessage());
+        consumed = true; // fail-open: never block recovery due to Redis outage
+        meterRegistry
+            .counter("queue.recovery.tps", "queue", metaData.getName(), "result", "failopen")
+            .increment();
+      }
+      acquiredPermit = consumed;
+    } else {
+      acquiredPermit = limiter.tryAcquire();
+    }
+    boolean listeners = hasListeners();
+
+    if (!emitting || !acquiredPermit || !listeners) {
+      if (log.isDebugEnabled()) {
+        log.debug(
+            "Pipe fallback to durable for queue [{}]: emitting={}, acquiredPermit={}, listeners={}",
+            metaData.getName(),
+            emitting,
+            acquiredPermit,
+            listeners);
+      }
+      meterRegistry
+          .counter(
+              "queue.pipe.fallback",
+              "queue",
+              metaData.getName(),
+              "reason",
+              !emitting ? "backpressure" : (!acquiredPermit ? "rate_limit" : "no_listeners"))
+          .increment();
+      pushToDurable(message, action);
+      return;
+    }
+
+    meterRegistry.counter("queue.pipe.direct", "queue", metaData.getName()).increment();
+
+    nextConsumer(metaData.getName())
+        .ifPresentOrElse(
+            consumer -> {
+              // Back pressure pause
+              if (inFlight.get() >= maxInflight && isEmitting.compareAndSet(true, false)) {
+                pushToDurable(message, action);
+                return;
+              }
+              inFlight.incrementAndGet();
+
+              // Track start time for RTT measurement
+              long startTime = System.nanoTime();
+
+              // 🚀 Use Mono.defer() to LAZILY construct the entire chain
+              // This ensures nothing is evaluated until subscription happens on the elastic
+              // scheduler
+              Mono.defer(
+                      () ->
+                          consumer
+                              .makeRequest(message)
+                              .doOnSuccess(
+                                  ack -> {
+                                    // Record RTT metric
+                                    long rttMs = (System.nanoTime() - startTime) / 1_000_000;
+                                    meterRegistry
+                                        .timer("queue.pipe.rtt", "queue", metaData.getName())
+                                        .record(rttMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+                                    if (!ack.isStatus()) {
+                                      if (ack.isRetrable()) {
+                                        // Retry → durable queue only
+                                        pushToDurable(message, action);
+                                        meterRegistry
+                                            .counter(
+                                                "queue.pipe.retries", "queue", metaData.getName())
+                                            .increment();
+
+                                      } else {
+                                        // Non-retry error → simulate publish + consume
+                                        meterRegistry
+                                            .counter(
+                                                "queue." + action + ".pipe",
+                                                "queue",
+                                                metaData.getName())
+                                            .increment();
+                                        meterRegistry
+                                            .counter(
+                                                "queue.consume.pipe", "queue", metaData.getName())
+                                            .increment();
+                                        meterRegistry
+                                            .counter(
+                                                "queue.consumer.errors",
+                                                "queue",
+                                                metaData.getName())
+                                            .increment();
+                                      }
+                                      consumer.onError();
+                                    } else {
+                                      // SUCCESS → simulate publish + consume
+                                      meterRegistry
+                                          .counter(
+                                              "queue." + action + ".pipe",
+                                              "queue",
+                                              metaData.getName())
+                                          .increment();
+                                      meterRegistry
+                                          .counter(
+                                              "queue.consume.pipe", "queue", metaData.getName())
+                                          .increment();
+                                      meterRegistry
+                                          .counter(
+                                              "queue.consumer.total", "queue", metaData.getName())
+                                          .increment();
+                                    }
+                                  })
+                              .doOnError(
+                                  e -> {
+                                    meterRegistry
+                                        .counter(
+                                            "queue." + action + ".pipe",
+                                            "queue",
+                                            metaData.getName())
+                                        .increment();
+                                    meterRegistry
+                                        .counter("queue.consume.pipe", "queue", metaData.getName())
+                                        .increment();
+                                    meterRegistry
+                                        .counter(
+                                            "queue.consumer.errors", "queue", metaData.getName())
+                                        .increment();
+                                    log.error(
+                                        "Consumer error for queue '{}': {}",
+                                        metaData.getName(),
+                                        e.getMessage(),
+                                        e);
+                                  })
+                              .doFinally(
+                                  signal -> {
+                                    int remaining = inFlight.decrementAndGet();
+                                    boolean canResume = remaining < maxInflight && hasListeners();
+                                    if (canResume && isEmitting.compareAndSet(false, true)) {
+                                      createScheduleIfnotExist();
+                                    }
+                                  }))
+                  .subscribeOn(reactor.core.scheduler.Schedulers.boundedElastic())
+                  .subscribe(
+                      result -> {
+                        /* Success handled in doOnSuccess above */
+                      },
+                      error -> {
+                        log.warn(
+                            "Subscription error for queue '{}': {}",
+                            metaData.getName(),
+                            error.getMessage());
+                        // Note: doFinally already decremented inFlight, don't double-decrement
+                      });
+            },
+            () -> pushToDurable(message, action));
+  }
+
+  private void pushToDurable(BigQueueTextMessage message, String action) {
+    try {
+      manager.publish(metaData.getName(), action, message);
+    } catch (Exception e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  private CompletableFuture<Integer> dipatchAsync(int messageNumber) {
+    CompletableFuture<Integer> future = new CompletableFuture<>();
+    // Note: Rate limiting is handled by the scheduler's batchSize and interval
+    // No need for limiter.tryAcquire() here as it causes double rate limiting
+    if (!limiter.tryAcquire()) {
+      future.complete(messageNumber);
+      return future;
+    }
+    try {
+      nextConsumer(this.metaData.getName())
+          .ifPresentOrElse(
+              consumer -> {
+                try {
+
+                  byte[] messageBytes = dequeue();
+                  if (messageBytes != null) {
+                    manager
+                        .handleMessage(metaData.getName(), messageBytes, consumer)
+                        .doOnError(
+                            ex -> {
+                              log.error(
+                                  "Error handling message {} from queue {}",
+                                  messageNumber,
+                                  metaData.getName(),
+                                  ex);
+                              future.completeExceptionally(ex);
+                            })
+                        .doOnSuccess(
+                            ack -> {
+                              // optionally check ack.status or similar
+                              if (!ack.isStatus() && ack.isRetrable()) {
+                                manager.deliverToDeadLetter(this.metaData.getName(), messageBytes);
+                              }
+                              future.complete(messageNumber);
+                            })
+                        .doOnError(
+                            e -> {
+                              meterRegistry
+                                  .counter("queue.consumer.errors", "queue", metaData.getName())
+                                  .increment();
+                              log.error(
+                                  "Consumer error for queue '{}': {}",
+                                  metaData.getName(),
+                                  e.getMessage(),
+                                  e);
+                            })
+                        .subscribe(
+                            ack -> {
+                              // Success already handled in doOnSuccess
+                            },
+                            error -> {
+                              // Error already handled in doOnError
+                              log.warn(
+                                  "Subscription error for message {}: {}",
+                                  messageNumber,
+                                  error.getMessage());
+                              // Complete future if not already done
+                              if (!future.isDone()) {
+                                future.completeExceptionally(error);
+                              }
+                            },
+                            () -> {
+                              // onComplete - ensure future is completed
+                              if (!future.isDone()) {
+                                log.warn(
+                                    "Completing future in onComplete for message {}",
+                                    messageNumber);
+                                future.complete(messageNumber);
+                              }
+                            });
+                  } else {
+                    // no message still complete future
+                    future.complete(messageNumber);
+                  }
+
+                } catch (Exception e) {
+                  future.completeExceptionally(e);
+                }
+              },
+              () -> {
+                // No consumer available → complete anyway
+                future.complete(messageNumber);
+              });
+
+    } catch (Exception ex) {
+      future.completeExceptionally(ex);
+    }
+    return future;
+  }
+
+  public void cancelScheduleIfExist(String reason) {
+
+    if (this.future.isPresent()) {
+      synchronized (metaData) {
+        if (this.future.isPresent()) {
+          log.info(
+              "Canceling fix rate schedular for queue {},due to {}", metaData.getName(), reason);
+          // recoveryStaging
+          this.future.get().cancel(false);
+          this.future = Optional.empty();
+        }
+      }
+    }
+  }
+
+  private boolean noMessageSinceLast1Min() {
+    long fiveMinutesMillis = 1 * 60 * 1000; // 5 minutes in ms
+    return (System.currentTimeMillis() - this.lastMessagedPushedAt) > fiveMinutesMillis;
+  }
+
+  public void assureDispatching(QueueMeta metaData, boolean locked) {
+    log.debug("assureDispatching for queue " + metaData.getName());
+    this.metaData.setTps(metaData.getTps());
+    ListenerHolder holder = manager.getListener(metaData.getName());
+    boolean hasListeners = holder != null && holder.size() > 0;
+    boolean hasMessages = queue.size() > 0;
+
+    // Dynamic inflight limit based on TPS, matching the connection pool in ReactiveMessageHandler
+    int maxInflight = Math.min(100, metaData.getTps() / 2);
+    int remaining = inFlight.get();
+
+    // Reset isEmitting if we have capacity
+    if (remaining < maxInflight) {
+      isEmitting.set(true);
+    }
+
+    // Re-read emitting AFTER potential reset above
+    boolean emitting = isEmitting.get();
+
+    log.debug(
+        "assureDispatching hasListeners={},hasMessages={},emitting={},noMessageSinceLast1Min={},locked={},remaining={} ",
+        hasListeners,
+        hasMessages,
+        emitting,
+        noMessageSinceLast1Min(),
+        locked,
+        remaining);
+
+    if (locked) {
+      this.cancelScheduleIfExist(
+          "Queue [" + metaData.getName() + "] is locked for deletion, canceling schedules");
+    }
+
+    if (emitting && hasListeners && hasMessages) {
+      // Normal case: dispatching should be active
+      this.createScheduleIfnotExist();
+    } else if (!emitting || !hasListeners) {
+      this.cancelScheduleIfExist(!emitting ? "Consumer overloaded" : "No active listenter(s)");
+    } else if (!hasMessages && noMessageSinceLast1Min()) {
+      this.cancelScheduleIfExist(
+          !hasMessages ? "Queue is empty" : "No message since last 5 minutes");
+    }
+
+    if (currentTps.get() != effectiveTps) {
+      this.cancelScheduleIfExist(
+          "TPS changed! from [" + currentTps.get() + "] to [" + effectiveTps + "]");
+      this.currentTps.set(effectiveTps);
+      this.limiter.setRate(effectiveTps);
+      // Rebuild the Redis-backed recovery bucket so its capacity matches the new TPS
+      recoveryProxyManager.removeProxy(RATE_LIMITER_KEY_PREFIX + metaData.getName());
+      this.recoveryBucket = buildRecoveryBucket(effectiveTps);
+      this.createScheduleIfnotExist(); // ensure it restarts with new TPS
+    }
+  }
+
+  public Optional<NamedConsumer<BigQueueTextMessage>> nextConsumer(String queueName) {
+    ListenerHolder holder = manager.getListener(metaData.getName());
+    if (holder == null) {
+      return Optional.empty();
+    }
+    return holder.nextConsumer(queueName);
+  }
+}
